@@ -14,24 +14,31 @@ namespace fs = std::filesystem;
 
 // --------------------- PATH HANDLING ---------------------
 string normalizePath(string path) {
-    // Remove quotes if present
-    if (path.size() >= 2 && path.front() == '"' && path.back() == '"') {
+    // Trim surrounding quotes (handles both single and double)
+    if (!path.empty() && 
+        ((path.front() == '"' && path.back() == '"') || 
+         (path.front() == '\'' && path.back() == '\''))) {
         path = path.substr(1, path.size() - 2);
     }
-    
-    // Replace backslashes with forward slashes
-    replace(path.begin(), path.end(), '\\', '/');
-    
-    // Remove any trailing slashes
-    while (!path.empty() && (path.back() == '/' || path.back() == '\\')) {
+
+    // Replace backslashes with forward slashes for consistency
+    std::replace(path.begin(), path.end(), '\\', '/');
+
+    // Remove trailing slashes (except if root)
+    while (path.size() > 1 && (path.back() == '/' || path.back() == '\\')) {
         path.pop_back();
     }
-    
-    // Convert to absolute path if relative
-    if (!fs::path(path).is_absolute()) {
-        path = fs::absolute(fs::path(path)).string();
+
+    // Convert to absolute and canonical form
+    try {
+        fs::path p = fs::absolute(path);
+        p = fs::weakly_canonical(p); // safer than canonical, tolerates missing dirs
+        path = p.generic_string();   // uses forward slashes consistently
+    } catch (const fs::filesystem_error&) {
+        // In case path doesn’t exist or something goes wrong, keep fallback
+        path = fs::absolute(fs::path(path)).generic_string();
     }
-    
+
     return path;
 }
 
