@@ -1,3 +1,4 @@
+
 #include <bits/stdc++.h>
 #include <thread>
 #include <mutex>
@@ -14,28 +15,23 @@ namespace fs = std::filesystem;
 
 // --------------------- PATH HANDLING ---------------------
 string normalizePath(string path) {
-    // Trim surrounding quotes (handles both single and double)
-    if (!path.empty() && 
-        ((path.front() == '"' && path.back() == '"') || 
+    if (!path.empty() &&
+        ((path.front() == '"' && path.back() == '"') ||
          (path.front() == '\'' && path.back() == '\''))) {
         path = path.substr(1, path.size() - 2);
     }
 
-    // Replace backslashes with forward slashes for consistency
     std::replace(path.begin(), path.end(), '\\', '/');
 
-    // Remove trailing slashes (except if root)
     while (path.size() > 1 && (path.back() == '/' || path.back() == '\\')) {
         path.pop_back();
     }
 
-    // Convert to absolute and canonical form
     try {
         fs::path p = fs::absolute(path);
-        p = fs::weakly_canonical(p); // safer than canonical, tolerates missing dirs
-        path = p.generic_string();   // uses forward slashes consistently
+        p = fs::weakly_canonical(p);
+        path = p.generic_string();   
     } catch (const fs::filesystem_error&) {
-        // In case path doesn’t exist or something goes wrong, keep fallback
         path = fs::absolute(fs::path(path)).generic_string();
     }
 
@@ -84,11 +80,10 @@ struct Compare {
     }
 };
 
-// Build Huffman Tree
 HuffmanNode* buildHuffmanTree(const unordered_map<char,int> &freqMap) {
     priority_queue<HuffmanNode*, vector<HuffmanNode*>, Compare> pq;
     for (auto &[c,f] : freqMap) pq.push(new HuffmanNode(c,f));
-    
+
     while (pq.size() > 1) {
         HuffmanNode* left = pq.top(); pq.pop();
         HuffmanNode* right = pq.top(); pq.pop();
@@ -100,7 +95,6 @@ HuffmanNode* buildHuffmanTree(const unordered_map<char,int> &freqMap) {
     return pq.top();
 }
 
-// Generate Huffman Codes
 void generateCodes(HuffmanNode* root, string code, unordered_map<char,string> &codes) {
     if (!root) return;
     if (!root->left && !root->right) {
@@ -110,11 +104,16 @@ void generateCodes(HuffmanNode* root, string code, unordered_map<char,string> &c
     generateCodes(root->right, code+"1", codes);
 }
 
-// Compress a chunk
-vector<char> compressChunk(const vector<char> &chunk, unordered_map<char,string> &outCodes) {
+// FIXED: Now accurately returns outBitLength to know where unpadded stream stops
+vector<char> compressChunk(const vector<char> &chunk, unordered_map<char,string> &outCodes, uint64_t &outBitLength) {
     unordered_map<char,int> freqMap;
     for (char c : chunk) freqMap[c]++;
-    
+
+    if (freqMap.empty()) {
+        outBitLength = 0;
+        return {};
+    }
+
     HuffmanNode* root = buildHuffmanTree(freqMap);
     unordered_map<char,string> codes;
     generateCodes(root, "", codes);
@@ -123,7 +122,8 @@ vector<char> compressChunk(const vector<char> &chunk, unordered_map<char,string>
     string bitString = "";
     for (char c : chunk) bitString += codes[c];
 
-    // Convert bit string to bytes
+    outBitLength = bitString.size(); // Track pre-padded size
+
     vector<char> compressed;
     for (size_t i=0; i<bitString.size(); i+=8) {
         string byteStr = bitString.substr(i, min((size_t)8, bitString.size()-i));
@@ -135,13 +135,14 @@ vector<char> compressChunk(const vector<char> &chunk, unordered_map<char,string>
 
 // --------------------- WORKER THREAD ---------------------
 void worker(SafeQueue<pair<int, vector<char>>> &inputQueue,
-            SafeQueue<pair<int, pair<vector<char>, unordered_map<char,string>>>> &outputQueue) {
+            SafeQueue<pair<int, pair<vector<char>, pair<unordered_map<char,string>, uint64_t>>>> &outputQueue) {
     while (true) {
         auto chunkPair = inputQueue.pop();
-        if (chunkPair.second.empty()) break; // termination signal
+        if (chunkPair.second.empty()) break;
         unordered_map<char,string> codes;
-        auto compressed = compressChunk(chunkPair.second, codes);
-        outputQueue.push({chunkPair.first, {compressed, codes}});
+        uint64_t bitLength = 0;
+        auto compressed = compressChunk(chunkPair.second, codes, bitLength);
+        outputQueue.push({chunkPair.first, {compressed, {codes, bitLength}}});
     }
 }
 
@@ -153,8 +154,9 @@ vector<char> readFileChunk(ifstream &file, size_t chunkSize) {
     return buffer;
 }
 
-// Write Huffman metadata to file
-void writeMetadata(ofstream &outFile, unordered_map<char,string> &codes) {
+// FIXED: Writes exact bit length into the chunk file metadata block
+void writeMetadata(ofstream &outFile, unordered_map<char,string> &codes, uint64_t bitLength) {
+    outFile.write(reinterpret_cast<char*>(&bitLength), sizeof(bitLength));
     uint32_t mapSize = codes.size();
     outFile.write(reinterpret_cast<char*>(&mapSize), sizeof(mapSize));
     for (auto &[c, code] : codes) {
@@ -166,12 +168,13 @@ void writeMetadata(ofstream &outFile, unordered_map<char,string> &codes) {
 }
 
 // --------------------- DECOMPRESSION ---------------------
-// Read Huffman metadata from file
-unordered_map<string,char> readMetadata(ifstream &inFile) {
+// FIXED: Reads back the exact valid bit length from metadata
+unordered_map<string,char> readMetadata(ifstream &inFile, uint64_t &outBitLength) {
     unordered_map<string,char> codes;
+    inFile.read(reinterpret_cast<char*>(&outBitLength), sizeof(outBitLength));
     uint32_t mapSize;
     inFile.read(reinterpret_cast<char*>(&mapSize), sizeof(mapSize));
-    
+
     for (uint32_t i = 0; i < mapSize; i++) {
         char c;
         uint32_t codeLen;
@@ -184,7 +187,6 @@ unordered_map<string,char> readMetadata(ifstream &inFile) {
     return codes;
 }
 
-// Convert bytes to bit string
 string bytesToBitString(const vector<char>& bytes) {
     string bits;
     for (unsigned char byte : bytes) {
@@ -195,14 +197,17 @@ string bytesToBitString(const vector<char>& bytes) {
     return bits;
 }
 
-// Decompress a chunk
-vector<char> decompressChunk(const vector<char>& compressedChunk, const unordered_map<string,char>& codes) {
+// FIXED: Drop out immediately when validBitLength is exhausted to completely bypass padding
+vector<char> decompressChunk(const vector<char>& compressedChunk, const unordered_map<string,char>& codes, uint64_t validBitLength) {
     string bitString = bytesToBitString(compressedChunk);
     vector<char> decompressed;
     string currentCode;
-    
+
+    size_t bitsProcessed = 0;
     for (char bit : bitString) {
+        if (bitsProcessed >= validBitLength) break;
         currentCode += bit;
+        bitsProcessed++;
         if (codes.count(currentCode)) {
             decompressed.push_back(codes.at(currentCode));
             currentCode.clear();
@@ -211,13 +216,12 @@ vector<char> decompressChunk(const vector<char>& compressedChunk, const unordere
     return decompressed;
 }
 
-// Worker thread for decompression
-void decompressWorker(SafeQueue<pair<int, pair<vector<char>, unordered_map<string,char>>>>& inputQueue,
+void decompressWorker(SafeQueue<pair<int, pair<vector<char>, pair<unordered_map<string,char>, uint64_t>>>>& inputQueue,
                      SafeQueue<pair<int, vector<char>>>& outputQueue) {
     while (true) {
         auto chunk = inputQueue.pop();
-        if (chunk.second.first.empty()) break; // termination signal
-        auto decompressed = decompressChunk(chunk.second.first, chunk.second.second);
+        if (chunk.second.first.empty()) break;
+        auto decompressed = decompressChunk(chunk.second.first, chunk.second.second.first, chunk.second.second.second);
         outputQueue.push({chunk.first, decompressed});
     }
 }
@@ -227,11 +231,13 @@ int main() {
     string inputFile, outputFile;
     string mode;
     int NUM_THREADS = 4;
-    size_t CHUNK_SIZE = 1024 * 1024; // 1 MB default
+    size_t CHUNK_SIZE = 1024 * 1024;
 
-    // ------------------ TERMINAL INPUT ------------------
+    // ------------------ FIXED TERMINAL INPUT ------------------
     cout << "Enter mode (c for compress, d for decompress): ";
-    getline(cin, mode);
+    cin >> mode;
+    cin.ignore(numeric_limits<streamsize>::max(), '\n'); // Clear stream buffer cleanly
+
     if (mode != "c" && mode != "d") {
         cerr << "Invalid mode. Use 'c' for compress or 'd' for decompress.\n";
         return 1;
@@ -245,13 +251,11 @@ int main() {
     getline(cin, outputFile);
     outputFile = normalizePath(outputFile);
 
-    // Validate input file exists
     if (!fs::exists(inputFile)) {
         cerr << "Input file does not exist.\n";
         return 1;
     }
 
-    // Check if input is a directory
     if (fs::is_directory(inputFile)) {
         cerr << "Input path is a directory. Please provide a file path.\n";
         return 1;
@@ -267,16 +271,13 @@ int main() {
     getline(cin, chunkInput);
     if (!chunkInput.empty()) CHUNK_SIZE = stoi(chunkInput) * 1024 * 1024;
 
-    // Get input file size for statistics
     uintmax_t inputFileSize = fs::file_size(inputFile);
 
-    // ------------------ VALIDATE FILES ------------------
     ifstream inFile(inputFile, ios::binary);
     if (!inFile.is_open()) { cerr << "Cannot open input file\n"; return 1; }
     ofstream outFile(outputFile, ios::binary);
     if (!outFile.is_open()) { cerr << "Cannot open output file\n"; return 1; }
 
-    // Start timing
     auto startTime = high_resolution_clock::now();
 
     if (mode == "c") {
@@ -284,81 +285,69 @@ int main() {
              << " threads and chunk size " << CHUNK_SIZE/(1024*1024) << " MB...\n";
 
         SafeQueue<pair<int, vector<char>>> inputQueue;
-        SafeQueue<pair<int, pair<vector<char>, unordered_map<char,string>>>> outputQueue;
+        SafeQueue<pair<int, pair<vector<char>, pair<unordered_map<char,string>, uint64_t>>>> outputQueue;
 
-        // ------------------ START WORKER THREADS ------------------
         vector<thread> threads;
         for (int i=0; i<NUM_THREADS; i++)
             threads.emplace_back(worker, ref(inputQueue), ref(outputQueue));
 
-        // ------------------ READ FILE AND PUSH CHUNKS ------------------
         int chunkId = 0;
         while (!inFile.eof()) {
             vector<char> chunk = readFileChunk(inFile, CHUNK_SIZE);
             if (!chunk.empty()) {
                 inputQueue.push({chunkId, chunk});
-                cout << "Processing chunk " << chunkId << " (" 
+                cout << "Processing chunk " << chunkId << " ("
                      << (float)inFile.tellg() / inputFileSize * 100 << "% complete)\n";
                 chunkId++;
             }
         }
 
-        // ------------------ TERMINATE THREADS ------------------
         for (int i=0; i<NUM_THREADS; i++) inputQueue.push({-1, {}});
-
-        // ------------------ JOIN THREADS ------------------
         for (auto &t : threads) t.join();
 
-        // ------------------ WRITE COMPRESSED FILE ------------------
-        vector<pair<vector<char>, unordered_map<char,string>>> compressedChunks(chunkId);
+        vector<pair<vector<char>, pair<unordered_map<char,string>, uint64_t>>> compressedChunks(chunkId);
         while (!outputQueue.empty()) {
             auto [id, data] = outputQueue.pop();
             compressedChunks[id] = data;
         }
 
-        for (auto &[chunk, codes] : compressedChunks) {
-            writeMetadata(outFile, codes);
+        for (auto &[chunk, meta] : compressedChunks) {
+            writeMetadata(outFile, meta.first, meta.second);
             uint32_t size = chunk.size();
             outFile.write(reinterpret_cast<char*>(&size), sizeof(size));
             outFile.write(chunk.data(), chunk.size());
         }
-    } else { // Decompression mode
+    } else {
         cout << "\nStarting decompression with " << NUM_THREADS << " threads...\n";
 
-        SafeQueue<pair<int, pair<vector<char>, unordered_map<string,char>>>> inputQueue;
+        SafeQueue<pair<int, pair<vector<char>, pair<unordered_map<string,char>, uint64_t>>>> inputQueue;
         SafeQueue<pair<int, vector<char>>> outputQueue;
 
-        // Start decompression threads
         vector<thread> threads;
         for (int i=0; i<NUM_THREADS; i++)
             threads.emplace_back(decompressWorker, ref(inputQueue), ref(outputQueue));
 
-        // Read and process chunks
         int chunkId = 0;
         while (inFile.peek() != EOF) {
-            // Read metadata for this chunk
-            auto codes = readMetadata(inFile);
-            
-            // Read compressed chunk
+            uint64_t bitLength = 0;
+            auto codes = readMetadata(inFile, bitLength);
+
             uint32_t chunkSize;
             inFile.read(reinterpret_cast<char*>(&chunkSize), sizeof(chunkSize));
             vector<char> compressedChunk(chunkSize);
             inFile.read(compressedChunk.data(), chunkSize);
 
-            cout << "Decompressing chunk " << chunkId << " (" 
+            cout << "Decompressing chunk " << chunkId << " ("
                  << (float)inFile.tellg() / inputFileSize * 100 << "% complete)\n";
 
-            inputQueue.push({chunkId++, {compressedChunk, codes}});
+            inputQueue.push({chunkId++, {compressedChunk, {codes, bitLength}}});
         }
 
-        // Signal threads to terminate
         for (int i=0; i<NUM_THREADS; i++)
-            inputQueue.push({-1, {{}, {}}});
+            inputQueue.push({-1, {{}, {{}, 0}}});
 
-        // Wait for threads to finish
         for (auto &t : threads) t.join();
 
-        // Write decompressed chunks in order
         vector<vector<char>> decompressedChunks(chunkId);
         while (!outputQueue.empty()) {
             auto [id, chunk] = outputQueue.pop();
@@ -370,26 +359,25 @@ int main() {
         }
     }
 
-    // Calculate and display statistics
     auto endTime = high_resolution_clock::now();
     auto duration = duration_cast<milliseconds>(endTime - startTime);
     uintmax_t outputFileSize = fs::file_size(outputFile);
-    
+
     cout << "\n-------- Operation Statistics --------\n";
     cout << "Operation: " << (mode == "c" ? "Compression" : "Decompression") << "\n";
     cout << "Input file size: " << inputFileSize << " bytes\n";
     cout << "Output file size: " << outputFileSize << " bytes\n";
-    
+
     if (mode == "c") {
         double ratio = (1.0 - static_cast<double>(outputFileSize) / inputFileSize) * 100;
         cout << "Compression ratio: " << fixed << setprecision(2) << ratio << "%\n";
     }
-    
+
     cout << "Processing time: " << duration.count() / 1000.0 << " seconds\n";
     cout << "Threads used: " << NUM_THREADS << "\n";
     cout << "Chunk size: " << CHUNK_SIZE / (1024 * 1024) << " MB\n";
     cout << "----------------------------------\n\n";
-    
+
     cout << "Operation completed successfully! Output file: " << outputFile << endl;
     return 0;
 }
